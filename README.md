@@ -15,21 +15,24 @@ This repository provides an end-to-end workflow to estimate **Total Suspended So
 ---
 
 ## Repository structure
+
+```text
 ML-Hyperspectral-TSS/
 ├─ Dataset/
-│ └─ Hyperspectral Dataset/
-│ ├─ EMIT_Download_link.txt
-│ └─ Prisma_Download_Link.txt
+│  └─ Hyperspectral Dataset/
+│     ├─ EMIT_Download_link.txt
+│     └─ Prisma_Download_Link.txt
 ├─ Machine Learning Models/
-│ └─ Models/
-│ ├─ Catboost_Model.pkl
-│ ├─ LightGBM_Model.pkl
-│ ├─ XgBoost_Model.pkl
-│ ├─ Random_Forest_Model.pkl
-│ └─ PLSR_VisNIR_400_900_Model.pkl
+│  └─ Models/
+│     ├─ Catboost_Model.pkl
+│     ├─ LightGBM_Model.pkl
+│     ├─ XgBoost_Model.pkl
+│     ├─ Random_Forest_Model.pkl
+│     └─ PLSR_VisNIR_400_900_Model.pkl
 └─ Scripts/
-├─ EMIT_Scripts/
-└─ Prisma_Scripts/
+   ├─ EMIT_Scripts/
+   └─ Prisma_Scripts/
+
 
 
 
