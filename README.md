@@ -8,9 +8,10 @@ This repository provides an end-to-end workflow to estimate **Total Suspended So
 - **Apply scripts** for hyperspectral sensors:
   - `Scripts/EMIT_Scripts/` (EMIT workflows)
   - `Scripts/Prisma_Scripts/` (PRISMA workflows)
-- **Data download links** (large files are not stored in the repo):
-  - `Dataset/Hyperspectral Dataset/EMIT_Download_link.txt`
-  - `Dataset/Hyperspectral Dataset/Prisma_Download_Link.txt`
+- **Data availability** (large files are not stored in the repo):
+  - The hyperspectral satellite datasets used in this study are publicly accessible through various platforms. PRISMA (PRecursore IperSpettrale della Missione Applicativa) data are available via the Italian Space Agency        (ASI) portal at https://prisma.asi.it (registration required). 
+  - EMIT (Earth Surface Mineral Dust Source Investigation) data are distributed by NASA through the ORNL DAAC at https://search.earthdata.nasa.gov. 
+  - PACE (Plankton, Aerosol, Cloud, ocean Ecosystem) data are accessible via NASA OceanColor Web at https://oceancolor.gsfc.nasa.gov.
 
 ---
 
