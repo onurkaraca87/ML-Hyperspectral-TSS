@@ -25,7 +25,7 @@ import joblib
 # =============================================================================
 
 # Your folder
-BASE_DIR = Path(r"D:\TWDB_5\TEST")  # <-- change if needed
+BASE_DIR = Path(r"......\CatBoost")  # <-- change if needed
 
 # Input PRISMA multiband GeoTIFF
 INPUT_TIF = BASE_DIR / "Prisma_20250310.tif"
@@ -224,3 +224,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
