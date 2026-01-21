@@ -1,95 +1,83 @@
-# ML-Hyperspectral-TSS
-
-Machine learning–based estimation of **Total Suspended Solids (TSS)** using **in situ hyperspectral reflectance** and **PRISMA, EMIT, and PACE** satellite imagery, with applications to optically complex estuarine environments.
-
----
-
-## 📌 Overview
-
-Accurate monitoring of Total Suspended Solids (TSS) is essential for understanding sediment transport, water clarity, and ecosystem health in coastal and estuarine systems.  
-This repository presents an integrated **hyperspectral remote sensing and machine learning framework** for TSS estimation, developed and tested in **Matagorda Bay** and **Trinity Bay (Texas, USA)**.
-
-The workflow combines:
-- Field-measured hyperspectral reflectance (400–900 nm),
-- Laboratory-derived TSS concentrations,
-- Advanced machine learning models,
-- Next-generation hyperspectral satellite data.
+# ML-Hyperspectral-TSS — One-Page Overview
+This repository provides an end-to-end workflow to estimate **Total Suspended Solids (TSS)** from **hyperspectral reflectance** using pretrained machine-learning models and apply them to **EMIT / PRISMA** hyperspectral imagery to generate **GeoTIFF TSS maps**.
 
 ---
 
-## 📊 Data
-
-### In situ Measurements
-- **117 water samples** collected during monthly field campaigns (Aug 2024 – Jul 2025)
-- Subsurface hyperspectral reflectance measured with a spectroradiometer (400–900 nm)
-- Laboratory-based gravimetric TSS analysis
-
-### Satellite Data
-- **PRISMA** (ASI)
-- **EMIT** (NASA)
-- **PACE** (NASA)
+## What’s inside
+- **Pretrained ML models** (`.pkl`): CatBoost, LightGBM, XGBoost, Random Forest, PLSR  
+- **Apply scripts** for hyperspectral sensors:
+  - `Scripts/EMIT_Scripts/` (EMIT workflows)
+  - `Scripts/Prisma_Scripts/` (PRISMA workflows)
+- **Data download links** (large files are not stored in the repo):
+  - `Dataset/Hyperspectral Dataset/EMIT_Download_link.txt`
+  - `Dataset/Hyperspectral Dataset/Prisma_Download_Link.txt`
 
 ---
 
-## 🧠 Machine Learning Models
-
-The following models are implemented and evaluated:
-
-- **CatBoost**
-- **Random Forest (RF)**
-- **XGBoost**
-- **LightGBM**
-- **Partial Least Squares Regression (PLSR)**
-
-Model performance is evaluated using:
-- R²
-- RMSE
-- MAE
-- MAPE
-- Pearson’s correlation coefficient  
-- **Taylor diagram analysis**
-
----
-
-## 🏆 Key Findings
-
-- **CatBoost and Random Forest** consistently outperform other models, achieving:
-  - Test R² up to **0.965**
-  - RMSE as low as **8.1 mg L⁻¹**
-- Feature importance analysis shows that **red and red–near-infrared wavelengths** dominate TSS retrieval, consistent with sediment scattering physics.
-- Trained models successfully capture:
-  - Nearshore–offshore TSS gradients
-  - River-influenced sediment pathways
-  - Seasonal variability across multiple sensors
-
----
-
-## 🗺️ Outputs
-
-- Spatially explicit TSS maps derived from PRISMA, EMIT, and PACE imagery
-- Multi-temporal assessment of estuarine sediment dynamics
-- Visualization-ready products for coastal management and research
-
----
-
-## 🛠️ Software & Tools
-
-- **Python** (NumPy, SciPy, Pandas, Matplotlib, Scikit-learn)
-- **GDAL / Rasterio**
-- **ArcGIS Pro**
-- **ENVI**
-- **SeaDAS**
-
----
-
-## 📁 Repository Structure (Planned)
-
-```text
+## Repository structure
 ML-Hyperspectral-TSS/
-│
-├── data/              # In situ and satellite data (not publicly shared)
-├── scripts/           # Python scripts for preprocessing and modeling
-├── notebooks/         # Jupyter notebooks
-├── figures/           # Figures and maps
-├── results/           # Model outputs
-└── README.md
+├─ Dataset/Hyperspectral Dataset/
+│ ├─ EMIT_Download_link.txt
+│ └─ Prisma_Download_Link.txt
+├─ Machine Learning Models/Models/
+│ ├─ Catboost_Model.pkl
+│ ├─ LightGBM_Model.pkl
+│ ├─ XgBoost_Model.pkl
+│ ├─ Random_Forest_Model.pkl
+│ └─ PLSR_VisNIR_400_900_Model.pkl
+└─ Scripts/
+├─ EMIT_Scripts/
+└─ Prisma_Scripts/
+
+
+
+
+---
+
+## Quick start
+### 1) Install
+```bash
+python -m venv .venv
+# Windows:
+.venv\Scripts\activate
+# macOS/Linux:
+source .venv/bin/activate
+
+pip install -r requirements.txt
+
+
+
+
+2) Apply a pretrained model (example: CatBoost → EMIT GeoTIFF)
+Goal: Open an EMIT hyperspectral GeoTIFF, match model wavelengths to the closest raster bands, predict TSS, and export a single-band GeoTIFF.
+Requirements / assumptions
+The EMIT GeoTIFF must include band descriptions with wavelength values readable via rasterio (src.descriptions), e.g., Band i (xxxx.xxxx).
+The model input features (example below) must match the exact training order.
+Nearest-band wavelength matching uses a tolerance (commonly 8 nm, adjustable).
+
+
+Example feature list (10-band input)
+model_bands = ["X_430","X_611","X_582","X_735","X_797","X_620","X_586","X_407","X_664","X_870"]
+
+
+Run (example)
+python Scripts/EMIT_Scripts/apply_catboost_emit.py
+
+
+Output
+Single-band float32 GeoTIFF (e.g., CatBoost_TSS_YYYYMMDD.tif)
+Georeferencing (CRS/transform/extent) inherited from the input raster
+Invalid pixels exported as NaN (nodata = NaN)
+
+Models
+Pretrained models are stored in:
+Machine Learning Models/Models/
+
+import joblib
+model = joblib.load("Machine Learning Models/Models/Catboost_Model.pkl")
+
+License
+MIT License (see LICENSE).
+
+Contact
+Onur Karaca — GitHub: @onurkaraca87
