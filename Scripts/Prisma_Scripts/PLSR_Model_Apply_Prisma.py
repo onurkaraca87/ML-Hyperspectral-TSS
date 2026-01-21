@@ -1,15 +1,4 @@
-# -*- coding: utf-8 -*-
 """
-Apply your saved log-log PLSR PKL bundle (Your_VisNIR_400_900_model_refit.pkl)
-to PRISMA raster using a band<->wavelength CSV and linear interpolation.
-
-Key fixes:
-- Reconstruct FULL feature order from bundle['vip_full_table'] (usually ~501)
-  so SimpleImputer.statistics_ matches feature count
-- Then select keep_cols (e.g., 143) for pls_refit
-- Robust physical masking + log safety + overflow clamp
-- Windowed processing
-
 @author: sokaraca
 """
 
@@ -247,3 +236,4 @@ with rasterio.open(PRISMA_TIF) as src:
 
 print("\n🎉 Done. Saved:")
 print(OUT_TIF)
+
