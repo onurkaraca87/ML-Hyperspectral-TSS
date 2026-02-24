@@ -2,9 +2,8 @@
 """
 -------------------------------------------------------------------------------
 Author:      Onur Karaca
-Contact:     +1 (346) 719-259 | onurkaraca87@hotmail.com
+Contact:     onurkaraca87@hotmail.com
 Website:     www.onurkaraca87.com
-Profiles:    LinkedIn: linkedin.com/in/onurkaraca | GitHub: github.com/onurkaraca
 -------------------------------------------------------------------------------
 Project:     LightGBM Balanced Pipeline for TSS Prediction
 Description: 
@@ -221,4 +220,5 @@ def main():
     logging.info(f"Pipeline finished successfully. Results saved in: {final_output_dir}")
 
 if __name__ == "__main__":
+
     main()
