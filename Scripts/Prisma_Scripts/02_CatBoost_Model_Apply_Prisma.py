@@ -1,227 +1,138 @@
 # -*- coding: utf-8 -*-
 """
-PRISMA → CatBoost TSS Prediction (10-band)  [HARDCODED VERSION]
+-------------------------------------------------------------------------------
+Author:      Onur Karaca
+Contact:     onurkaraca87@hotmail.com
+Website:     www.onurkaraca87.com
 
-- Input/Model/Band mapping are written INSIDE the script (no CLI arguments).
-- Applies a trained CatBoost model (joblib/pickle) to a multiband PRISMA GeoTIFF.
-- Reads specified bands in training order, predicts per-block (memory-safe),
-  and writes a single-band GeoTIFF output (TSS).
-
-Author: Onur Karaca
+-------------------------------------------------------------------------------
+Project:     PRISMA Raster Prediction - TSS Mapping
+Description: 
+    This production-ready script applies a trained CatBoost regression model 
+    to PRISMA L2D hyperspectral satellite imagery. 
+    
+    Key Features:
+    - Automated Band Alignment: Matches model features to PRISMA VNIR bands.
+    - Reflectance Scaling: Converts 0-10000 DN values to 0-1 reflectance.
+    - Masked Inference: Optimized for water pixel processing.
+-------------------------------------------------------------------------------
 """
 
-from __future__ import annotations
-
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
+import os
+import logging
+import joblib
 import numpy as np
 import rasterio
-import joblib
 
-
-# =============================================================================
-# 1) PATHS / SETTINGS  (EDIT THESE)
-# =============================================================================
-
-# Your folder
-BASE_DIR = Path(r"......\CatBoost")  # <-- change if needed
-
-# Input PRISMA multiband GeoTIFF
-INPUT_TIF = BASE_DIR / "Prisma_20250310.tif"
-
-# Trained CatBoost model (pickle/joblib)
-MODEL_PKL = BASE_DIR / "Catboost_Model.pkl"
-
-# Output GeoTIFF (single band: predicted TSS)
-OUTPUT_TIF = BASE_DIR / "Prisma_20250310__TSS.tif"
-
-# Output NoData and compression
-OUT_NODATA = np.float32(-9999.0)
-OUT_COMPRESS = "lzw"
-
+# --- Logging Configuration ---
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 # =============================================================================
-# 2) MODEL BAND NAMES (MUST MATCH TRAINING ORDER EXACTLY!)
+# 1) CONFIGURATION & PATHS
 # =============================================================================
-MODEL_BANDS: List[str] = [
-    "X_430", "X_611", "X_582", "X_735", "X_797",
-    "X_620", "X_586", "X_407", "X_664", "X_870",
-]
+# Path to your trained .pkl model
+MODEL_PATH = r"path/to/your/catboost_model_20260222.pkl"
+
+# Input PRISMA GeoTIFF file
+PRISMA_TIF = r"path/to/your/Prisma_geo_wm_correct_tif_renamed.tif"
+
+# Output directory for the prediction map
+OUTPUT_DIR = r"path/to/your/output/Prisma_Results"
+
+# Critical: Ordered list of bands used during model training
+MODEL_FEATURES = ['X_634', 'X_647', 'X_422', 'X_584', 'X_482', 
+                  'X_897', 'X_719', 'X_600', 'X_889', 'X_779']
+
+# PRISMA VNIR wavelength definition (Standard 63 bands: 400nm to 1010nm)
+PRISMA_VNIR_WL = np.linspace(400, 1010, 63)
 
 
-# =============================================================================
-# 3) BAND INDICES (MOST IMPORTANT PART!)
-#    These integers are the band numbers inside your PRISMA GeoTIFF.
-#    Rasterio uses 1-based indexing: band 1 = first band.
-#
-#    ⚠️ The values below are EXAMPLES. REPLACE with your true mapping.
-# =============================================================================
-BAND_INDICES: Dict[str, int] = {
-    "X_430": 3,
-    "X_611": 27,
-    "X_582": 24,
-    "X_735": 40,
-    "X_797": 46,
-    "X_620": 28,
-    "X_586": 25,
-    "X_407": 1,
-    "X_664": 33,
-    "X_870": 53,
-}
 
-
-# =============================================================================
-# 4) HELPER FUNCTIONS
-# =============================================================================
-
-def warn_duplicate_indices(band_indices: Dict[str, int]) -> None:
-    inv: Dict[int, List[str]] = {}
-    for name, idx in band_indices.items():
-        inv.setdefault(idx, []).append(name)
-    dups = [(idx, names) for idx, names in inv.items() if len(names) > 1]
-    if dups:
-        print("⚠️ WARNING: Duplicate band indices detected (same raster band used multiple times):")
-        for idx, names in dups:
-            print(f"   band #{idx}: {names}")
-        print("   Please verify your wavelength→band mapping.\n")
-
-
-def validate_mapping(model_bands: List[str], band_indices: Dict[str, int], src_count: int) -> None:
-    missing = [b for b in model_bands if b not in band_indices]
-    if missing:
-        raise ValueError(f"Missing band index for: {missing}")
-
-    bad_range = [(b, band_indices[b]) for b in model_bands if not (1 <= band_indices[b] <= src_count)]
-    if bad_range:
-        msg = ", ".join([f"{b}={idx}" for b, idx in bad_range])
-        raise ValueError(f"Band indices out of range (valid 1..{src_count}): {msg}")
-
-
-def try_check_feature_names(model, model_bands: List[str]) -> None:
-    feat: Optional[List[str]] = None
-    if hasattr(model, "feature_names_"):
-        try:
-            feat = list(getattr(model, "feature_names_"))
-        except Exception:
-            feat = None
-
-    if feat and feat != model_bands:
-        print("⚠️ WARNING: Model feature_names_ != MODEL_BANDS.")
-        print(f"   model feature_names_: {feat}")
-        print(f"   provided MODEL_BANDS: {model_bands}")
-        print("   If names/order do not match training, predictions will be invalid.\n")
-
-
-def predict_block(
-    model,
-    src: rasterio.io.DatasetReader,
-    window: rasterio.windows.Window,
-    model_bands: List[str],
-    band_indices: Dict[str, int],
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Returns:
-      pred_2d: float32, shape (h,w), np.nan where invalid
-      valid_2d: bool, shape (h,w)
-    """
-    arrays: List[np.ndarray] = []
-    masks: List[np.ndarray] = []
-
-    for bname in model_bands:
-        bnum = band_indices[bname]
-        arr = src.read(bnum, window=window).astype(np.float32)
-        msk = src.read_masks(bnum, window=window)  # uint8 (0 invalid, 255 valid)
-
-        # Apply source nodata if defined
-        if src.nodata is not None:
-            arr = np.where(arr == src.nodata, np.nan, arr)
-
-        arrays.append(arr)
-        masks.append(msk)
-
-    # (C,H,W)
-    arr_stack = np.stack(arrays, axis=0)
-    msk_stack = np.stack(masks, axis=0)
-
-    # Valid if: all bands finite AND all masks > 0
-    finite_ok = np.all(np.isfinite(arr_stack), axis=0)   # (H,W)
-    mask_ok = np.all(msk_stack > 0, axis=0)              # (H,W)
-    valid_2d = finite_ok & mask_ok
-
-    # Features (N,C)
-    hwc = np.transpose(arr_stack, (1, 2, 0))             # (H,W,C)
-    feats = hwc.reshape(-1, len(model_bands))            # (N,C)
-    valid_flat = valid_2d.reshape(-1)
-
-    preds_flat = np.full((feats.shape[0],), np.nan, dtype=np.float32)
-    if np.any(valid_flat):
-        preds_flat[valid_flat] = model.predict(feats[valid_flat])
-
-    pred_2d = preds_flat.reshape(hwc.shape[0], hwc.shape[1]).astype(np.float32)
-    return pred_2d, valid_2d
-
-
-# =============================================================================
-# 5) MAIN
-# =============================================================================
-
-def main() -> None:
-    print("=== PRISMA → CatBoost TSS Prediction (Hardcoded) ===")
-    print(f"📁 BASE_DIR   : {BASE_DIR}")
-    print(f"📥 INPUT_TIF  : {INPUT_TIF}")
-    print(f"🧠 MODEL_PKL  : {MODEL_PKL}")
-    print(f"📤 OUTPUT_TIF : {OUTPUT_TIF}")
-    print(f"🧩 MODEL_BANDS (order matters): {MODEL_BANDS}\n")
-
-    # Check files exist
-    if not INPUT_TIF.exists():
-        raise FileNotFoundError(f"Input not found: {INPUT_TIF}")
-    if not MODEL_PKL.exists():
-        raise FileNotFoundError(f"Model not found: {MODEL_PKL}")
-
-    warn_duplicate_indices(BAND_INDICES)
-
+def main():
     # Load model
-    model = joblib.load(MODEL_PKL)
-    print("✅ Model loaded.")
-    try_check_feature_names(model, MODEL_BANDS)
+    if not os.path.exists(MODEL_PATH):
+        logging.error(f"Model file not found at: {MODEL_PATH}")
+        return
+    
+    model = joblib.load(MODEL_PATH)
+    logging.info("CatBoost model successfully loaded.")
 
-    # Open raster, validate mapping, process by blocks
-    with rasterio.open(INPUT_TIF) as src:
-        print(f"📦 Source bands: {src.count} | size: {src.width} x {src.height}")
-        print(f"ℹ️ src.nodata : {src.nodata}\n")
-
-        validate_mapping(MODEL_BANDS, BAND_INDICES, src.count)
-
+    # =========================================================================
+    # 2) SPECTRAL BAND MAPPING
+    # =========================================================================
+    with rasterio.open(PRISMA_TIF) as src:
         profile = src.profile.copy()
-        profile.update(
-            dtype=rasterio.float32,
-            count=1,
-            nodata=OUT_NODATA,
-            compress=OUT_COMPRESS,
-        )
+        
+        band_indices = []
+        logging.info("Starting manual band mapping...")
+        
+        for feat in MODEL_FEATURES:
+            # Extract target wavelength from feature name (e.g., 'X_634' -> 634.0)
+            target_wl = float(feat.split('_')[1])
+            
+            # Find index of the closest PRISMA band (0-indexed)
+            closest_idx = (np.abs(PRISMA_VNIR_WL - target_wl)).argmin()
+            band_num = int(closest_idx + 1) # Rasterio uses 1-based indexing
+            
+            band_indices.append(band_num)
+            logging.info(f"Feature {feat} matched to PRISMA Band #{band_num} ({PRISMA_VNIR_WL[closest_idx]:.2f} nm)")
 
-        total_valid = 0
-        total_px = 0
+        # Read and scale spectral bands
+        bands_data = []
+        for bnum in band_indices:
+            band_arr = src.read(bnum).astype(np.float32)
+            
+            # Scaling logic: PRISMA L2D data is typically scaled by 10,000. 
+            # We convert it back to 0.0 - 1.0 range as expected by the model.
+            if np.nanmax(band_arr) > 10:
+                band_arr *= 0.0001
+            
+            bands_data.append(band_arr)
 
-        OUTPUT_TIF.parent.mkdir(parents=True, exist_ok=True)
+        # Reshape to (Height, Width, Features)
+        stacked_data = np.stack(bands_data, axis=-1)
 
-        with rasterio.open(OUTPUT_TIF, "w", **profile) as dst:
-            for _, window in src.block_windows(1):
-                pred_2d, valid_2d = predict_block(model, src, window, MODEL_BANDS, BAND_INDICES)
+    # =========================================================================
+    # 3) PIXEL-WISE PREDICTION
+    # =========================================================================
+    h, w, c = stacked_data.shape
+    pixels_flat = stacked_data.reshape(-1, c)
 
-                # NaN -> nodata
-                pred_write = np.where(np.isfinite(pred_2d), pred_2d, OUT_NODATA).astype(np.float32)
-                dst.write(pred_write, 1, window=window)
+    # Optimization: Process only valid pixels (finite values and positive reflectance)
+    # This acts as a basic water/land mask based on spectral presence.
+    valid_mask = np.all(np.isfinite(pixels_flat), axis=1) & (np.any(pixels_flat > 0, axis=1))
 
-                total_valid += int(valid_2d.sum())
-                total_px += int(valid_2d.size)
+    logging.info(f"Executing prediction for {np.sum(valid_mask)} valid pixels...")
 
-        print(f"✔️ Valid pixels: {total_valid} / {total_px}")
-        print("🎉 Done.")
+    # Initialize prediction array with NaNs
+    final_preds = np.full((pixels_flat.shape[0],), np.nan, dtype=np.float32)
 
+    if np.any(valid_mask):
+        # Run CatBoost Inference
+        predictions = model.predict(pixels_flat[valid_mask])
+        final_preds[valid_mask] = predictions.astype(np.float32)
+
+    # Reshape back to 2D spatial map
+    tss_prediction_map = final_preds.reshape(h, w)
+
+    # =========================================================================
+    # 4) GEOTIFF EXPORT
+    # =========================================================================
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_path = os.path.join(OUTPUT_DIR, "PRISMA_TSS_Prediction_Map.tif")
+
+    # Update metadata for output
+    profile.update(
+        dtype=rasterio.float32, 
+        count=1, 
+        compress="lzw", 
+        nodata=np.nan
+    )
+
+    with rasterio.open(output_path, "w", **profile) as dst:
+        dst.write(tss_prediction_map, 1)
+
+    logging.info(f"Process complete. Output saved to:\n{output_path}")
 
 if __name__ == "__main__":
     main()
-
