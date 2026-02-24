@@ -1,6 +1,12 @@
 ML-Hyperspectral-TSS
 This repository provides an end-to-end workflow to estimate Total Suspended Solids (TSS) from hyperspectral reflectance using machine-learning models, and apply them to PRISMA / EMIT / PACE hyperspectral imagery to generate GeoTIFF TSS maps.
 
+
+
+
+
+![Screenshot_2](Figures/Screenshot_2.jpg)
+
 Main idea (2-step):
 1) Train (tabular) -> produces a pretrained model file (.pkl)
 2) Apply (raster) -> loads the .pkl, matches wavelengths to sensor bands, predicts pixel-wise TSS, exports a single-band GeoTIFF
