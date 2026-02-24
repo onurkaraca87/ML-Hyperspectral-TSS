@@ -1,177 +1,153 @@
 # -*- coding: utf-8 -*-
 """
-Apply a trained Random Forest model (10 spectral bands) to a PRISMA GeoTIFF and
-save the prediction raster to disk.
+-------------------------------------------------------------------------------
+Author:      Onur Karaca
+Contact:     onurkaraca87@hotmail.com
+Website:     www.onurkaraca87.com
 
-What this script does
----------------------
-1) Loads a scikit-learn compatible Random Forest model from a .pkl file
-2) Reads the required PRISMA bands (based on your feature list)
-3) Stacks bands into a (H, W, C) array
-4) Flattens pixels, masks invalid values, and runs model prediction
-5) Writes the predicted raster as a single-band GeoTIFF (LZW compressed)
-
-IMPORTANT
----------
-- Update BAND_INDICES with the correct 1-based PRISMA band numbers for each feature
-  (Rasterio reads bands using 1-based indexing: band 1..N).
-- Ensure the band order in MODEL_BANDS matches the order used during training.
-
-Author: Onur Karaca
-Created: 2025-11-03
+-------------------------------------------------------------------------------
+Project:     PRISMA Raster Prediction - Random Forest Pipeline (Top-10 Bands)
+Description: 
+    This script performs spatial inference on PRISMA hyperspectral L2D imagery 
+    using a pre-trained Random Forest Regressor. 
+    
+    Key Features:
+    - Specific Feature Mapping: Uses exactly the Top 10 bands identified 
+      during feature selection.
+    - Band Alignment: Matches model feature names (wavelengths) to the 
+      nearest available PRISMA VNIR bands.
+    - Reflectance Calibration: Automatically scales PRISMA DN (0-10000) 
+      to reflectance (0-1) values.
+    - Robust Validation: Includes error handling for feature name mismatches.
+-------------------------------------------------------------------------------
 """
 
-from __future__ import annotations
-
-from pathlib import Path
-import numpy as np
-import rasterio
+import os
+import sys
+import logging
 import joblib
+import numpy as np
+import pandas as pd
+import rasterio
 
-
-# =============================================================================
-# 1) CONFIGURATION (UPDATED FOR: D:\TWDB_5\TEST)
-# =============================================================================
-
-# Base folder shown in your screenshot
-BASE_DIR = Path(r".....\Random_Forest")
-
-# Trained model file (in BASE_DIR)
-MODEL_PATH = BASE_DIR / "Random_Forest_Model.pkl"
-
-# PRISMA GeoTIFF file (in BASE_DIR)
-PRISMA_TIF = BASE_DIR / "Prisma_20250310.tif"
-
-# Output settings
-OUTPUT_DIR = BASE_DIR / "Model_sonuclari"  # change to BASE_DIR if you want output directly in TEST
-OUTPUT_TIF_NAME = "PRISMA_20250310_RF_TSS_Prediction.tif"
-
+# --- Logging Configuration ---
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 # =============================================================================
-# 2) MODEL FEATURES (10 BANDS)
+# 1) CONFIGURATION & PATHS
 # =============================================================================
+# Path to the pre-trained Random Forest model
+MODEL_PATH = r"path/to/your/rf_model_20260222.pkl"
 
-# The 10 feature/band names used during training (must match training feature names)
-MODEL_BANDS = [
-    "X_630",
-    "X_625",
-    "X_635",
-    "X_615",
-    "X_495",
-    "X_684",
-    "X_638",
-    "X_585",
-    "X_606",
-    "X_485",
+# Input PRISMA GeoTIFF (Hyperspectral cube)
+PRISMA_TIF = r"path/to/your/Prisma_geo_wm_correct_tif_renamed.tif"
+
+# Output directory for prediction maps
+OUTPUT_DIR = r"path/to/your/output/Prisma_Results"
+
+# Top 10 Selected Bands (Must match the exact feature names used in training)
+TOP_10_FEATURES = [
+    'X_630', 'X_677', 'X_488', 'X_522', 'X_684', 
+    'X_625', 'X_819', 'X_489', 'X_500', 'X_504'
 ]
 
-# Map each feature name to the PRISMA GeoTIFF band number (1-based).
-# Replace the example values with your true PRISMA band indices.
-BAND_INDICES = {
-    "X_630": 30,  # example
-    "X_625": 29,  # example
-    "X_635": 31,  # example
-    "X_615": 28,  # example
-    "X_495": 13,  # example
-    "X_684": 35,  # example
-    "X_638": 32,  # example
-    "X_585": 24,  # example
-    "X_606": 27,  # example
-    "X_485": 11,  # example
-}
+# PRISMA VNIR spectral range (Standard 63 bands: 400nm to 1010nm)
+PRISMA_VNIR_WL = np.linspace(400, 1010, 63)
 
 
-# =============================================================================
-# 3) VALIDATION HELPERS
-# =============================================================================
 
-def validate_inputs() -> None:
-    """Validate that input files and band mapping are consistent."""
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"Model file not found:\n  {MODEL_PATH}")
+def main():
+    # Load Random Forest Model
+    if not os.path.exists(MODEL_PATH):
+        logging.error("Model file not found! Please check the path.")
+        sys.exit()
 
-    if not PRISMA_TIF.exists():
-        raise FileNotFoundError(f"PRISMA GeoTIFF not found:\n  {PRISMA_TIF}")
-
-    missing = [b for b in MODEL_BANDS if b not in BAND_INDICES]
-    if missing:
-        raise ValueError(f"Missing BAND_INDICES entries for: {missing}")
-
-    invalid = {k: v for k, v in BAND_INDICES.items() if not isinstance(v, int) or v < 1}
-    if invalid:
-        raise ValueError(f"Invalid band indices (must be positive integers): {invalid}")
-
-
-# =============================================================================
-# 4) MAIN WORKFLOW
-# =============================================================================
-
-def main() -> None:
-    validate_inputs()
-
-    # --- Load the trained model
     model = joblib.load(MODEL_PATH)
-    print(f"✅ Random Forest model loaded:\n  {MODEL_PATH}")
+    logging.info("Random Forest model successfully loaded.")
 
-    # --- Read PRISMA bands and stack
+    # =========================================================================
+    # 2) SPECTRAL ALIGNMENT & DATA READING
+    # =========================================================================
+    
+
     with rasterio.open(PRISMA_TIF) as src:
         profile = src.profile.copy()
-        height, width = src.height, src.width
+        
+        band_indices = []
+        logging.info("=== Mapping Selected Features to PRISMA Bands ===")
+        
+        for feat in TOP_10_FEATURES:
+            # Extract wavelength from string (e.g., 'X_630' -> 630.0)
+            target_wl = float(feat.split('_')[1])
+            
+            # Find the nearest wavelength index in PRISMA VNIR
+            idx = (np.abs(PRISMA_VNIR_WL - target_wl)).argmin()
+            band_num = int(idx + 1) # Rasterio uses 1-based indexing
+            
+            band_indices.append(band_num)
+            logging.info(f"{feat:>8} -> PRISMA Band #{band_num:2d} ({PRISMA_VNIR_WL[idx]:.2f} nm)")
 
-        print(f"\n🛰️ Input raster:\n  {PRISMA_TIF}")
-        print(f"📐 Raster dimensions (W x H): {width} x {height}")
-        print(f"📦 Total bands in file: {src.count}")
+        # Read spectral bands and scale to 0-1 range
+        bands_list = []
+        for bnum in band_indices:
+            arr = src.read(int(bnum)).astype(np.float32)
+            
+            # Calibration: DN to Reflectance transformation
+            if np.nanmax(arr) > 10:
+                arr *= 0.0001
+            bands_list.append(arr)
 
-        band_arrays = []
-        for band_name in MODEL_BANDS:
-            band_num = BAND_INDICES[band_name]
+        stacked_cube = np.stack(bands_list, axis=-1)
 
-            if band_num > src.count:
-                raise ValueError(
-                    f"Band index out of range for {band_name}: {band_num} "
-                    f"(GeoTIFF has {src.count} bands)"
-                )
+    # =========================================================================
+    # 3) PIXEL-WISE PREDICTION
+    # =========================================================================
+    h, w, c = stacked_cube.shape
+    pixels_flat = stacked_cube.reshape(-1, c)
+    
+    # Generate mask for valid data (non-NaN and positive reflectance)
+    valid_mask = np.all(np.isfinite(pixels_flat), axis=1) & (np.any(pixels_flat > 0, axis=1))
 
-            print(f"→ Reading {band_name} (band #{band_num})")
-            arr = src.read(band_num).astype(np.float32)
-            band_arrays.append(arr)
+    logging.info(f"Processing {np.sum(valid_mask)} valid pixels...")
 
-        # Stack to shape (H, W, C)
-        stacked = np.stack(band_arrays, axis=0).transpose(1, 2, 0)
-        print(f"✅ Stacked shape (H, W, C): {stacked.shape}")
+    # Initialize prediction array with NaNs for background
+    predictions_flat = np.full((pixels_flat.shape[0],), np.nan, dtype=np.float32)
 
-    # --- Flatten for prediction
-    pixels_flat = stacked.reshape(-1, len(MODEL_BANDS))  # (N_pixels, 10)
+    if np.any(valid_mask):
+        # Create DataFrame to maintain feature name consistency for Random Forest
+        X_valid = pd.DataFrame(pixels_flat[valid_mask], columns=TOP_10_FEATURES)
+        
+        try:
+            preds = model.predict(X_valid)
+            predictions_flat[valid_mask] = preds.astype(np.float32)
+        except ValueError as e:
+            logging.error("FEATURE MISMATCH ERROR!")
+            logging.info("The model may be expecting more features than the 10 provided.")
+            logging.info("Verify if the model was re-fitted specifically with these 10 bands.")
+            logging.error(f"Details: {e}")
+            sys.exit()
 
-    # Mask valid pixels (finite values across all bands)
-    valid_mask = np.all(np.isfinite(pixels_flat), axis=1)
-    valid_pixels = pixels_flat[valid_mask]
+    # Reshape prediction array back to 2D raster dimensions
+    tss_map = predictions_flat.reshape(h, w)
 
-    print(f"\n🔎 Valid pixels: {valid_pixels.shape[0]} / {pixels_flat.shape[0]}")
+    # =========================================================================
+    # 4) GEOTIFF EXPORT
+    # =========================================================================
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_filename = os.path.join(OUTPUT_DIR, "PRISMA_RF_TSS_Prediction.tif")
 
-    # --- Predict
-    preds = np.full((pixels_flat.shape[0],), np.nan, dtype=np.float32)
-    preds[valid_mask] = model.predict(valid_pixels).astype(np.float32)
-
-    prediction_raster = preds.reshape(height, width)
-    print(f"✅ Prediction raster shape: {prediction_raster.shape}")
-
-    # --- Write output GeoTIFF
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    output_tif = OUTPUT_DIR / OUTPUT_TIF_NAME
-
+    # Update metadata for single-band output
     profile.update(
-        dtype=rasterio.float32,
-        count=1,
-        compress="lzw",
-        # nodata=np.nan,  # optional; some GIS tools do not love NaN nodata
+        dtype=rasterio.float32, 
+        count=1, 
+        compress="lzw", 
+        nodata=np.nan
     )
 
-    with rasterio.open(output_tif, "w", **profile) as dst:
-        dst.write(prediction_raster, 1)
+    with rasterio.open(output_filename, "w", **profile) as dst:
+        dst.write(tss_map, 1)
 
-    print(f"\n🎉 Prediction saved to:\n  {output_tif}")
-
+    logging.info(f"Success! Prediction map generated at: {output_filename}")
 
 if __name__ == "__main__":
     main()
