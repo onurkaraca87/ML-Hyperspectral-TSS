@@ -1,115 +1,150 @@
 # -*- coding: utf-8 -*-
 """
-Apply trained LightGBM (10-band model) to PRISMA raster
-and save prediction raster to the model results folder.
+-------------------------------------------------------------------------------
+Author:      Onur Karaca
+Contact:     onurkaraca87@hotmail.com
+Website:     www.onurkaraca87.com
 
-Author: sokaraca
-Date: 2025-11-14
+-------------------------------------------------------------------------------
+Project:     PRISMA Raster Prediction - LightGBM Pipeline
+Description: 
+    This script implements an inference pipeline for hyperspectral PRISMA L2D 
+    imagery using a pre-trained LightGBM regression model. 
+    
+    Key Features:
+    - Band Selection: Maps model-specific features to PRISMA VNIR bands.
+    - Spectral Scaling: Calibrates PRISMA Digital Numbers to reflectance values.
+    - Optimized Inference: Uses pandas DataFrame input to satisfy LightGBM 
+      feature name requirements.
+    - Spatial Export: Generates a georeferenced TSS (Total Suspended Solids) map.
+-------------------------------------------------------------------------------
 """
 
 import os
-import numpy as np
-import rasterio
+import sys
+import logging
 import joblib
+import numpy as np
+import pandas as pd
+import rasterio
 
-# ============================================================
-# 1) Load trained LightGBM model
-# ============================================================
-model_dir = r".....\lightGBM"
-model_path = os.path.join(model_dir, "LightGBM_Model.pkl")
+# --- Logging Configuration ---
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
-model = joblib.load(model_path)
-print(f"✅ LightGBM model loaded: {model_path}")
+# =============================================================================
+# 1) CONFIGURATION & PATHS
+# =============================================================================
+# Path to the pre-trained LightGBM model (.pkl)
+MODEL_PATH = r"path/to/your/lgbm_balanced_model_20260222.pkl"
 
-# ============================================================
-# 2) PRISMA raster
-# ============================================================
-prisma_tif = r"...........\Prisma_20250310.tif"
+# Input PRISMA Hyperspectral GeoTIFF
+PRISMA_TIF = r"path/to/your/Prisma_geo_wm_correct_tif_renamed.tif"
 
-# ============================================================
-# 3) The 10 selected wavelengths (from your importance figure)
-# ============================================================
-model_bands = [
-    "X_400",
-    "X_696",
-    "X_781",
-    "X_508",
-    "X_843",
-    "X_545",
-    "X_497",
-    "X_717",
-    "X_880",
-    "X_401"
+# Output directory for predicted rasters
+OUTPUT_DIR = r"path/to/your/output/Prisma_Results"
+
+# LightGBM Top 10 Selected Spectral Bands
+MODEL_BANDS = [
+    'X_400', 'X_696', 'X_508', 'X_866', 'X_880', 
+    'X_781', 'X_545', 'X_717', 'X_843', 'X_497'
 ]
 
-# ============================================================
-# 4) Map PRISMA actual band indices (you MUST update these!)
-#    PRISMA Band 1 = index 1
-# ============================================================
+# PRISMA VNIR Spectral range (63 bands: 400nm to 1010nm)
+PRISMA_VNIR_WL = np.linspace(400, 1010, 63)
 
-band_indices = {
-    "X_400": 1,   # example
-    "X_696": 36,   # example
-    "X_781": 45,    # example
-    "X_508": 15,   # example
-    "X_843": 51,   # example
-    "X_545": 19,   # example
-    "X_497": 13,   # example
-    "X_717": 38,   # example
-    "X_880": 54,    # example
-    "X_401": 1    # example
-}
 
-# ============================================================
-# 5) Read raster & extract selected bands
-# ============================================================
-with rasterio.open(prisma_tif) as src:
-    profile = src.profile.copy()
-    height, width = src.height, src.width
 
-    print(f"🚀 Raster size: {width} x {height}")
-    print(f"📏 Total raster bands available: {src.count}")
+def main():
+    # Load LightGBM Model
+    if not os.path.exists(MODEL_PATH):
+        logging.error(f"Model file not found at: {MODEL_PATH}")
+        sys.exit()
 
-    bands_data = []
-    for band_name in model_bands:
-        if band_name not in band_indices:
-            raise ValueError(f"❌ No band index for {band_name} in band_indices!")
+    try:
+        model = joblib.load(MODEL_PATH)
+        logging.info("LightGBM model loaded successfully.")
+    except Exception as e:
+        logging.error(f"Failed to load model: {e}")
+        sys.exit()
 
-        band_num = band_indices[band_name]
-        arr = src.read(band_num).astype(np.float32)
-        bands_data.append(arr)
+    # =========================================================================
+    # 2) BAND ALIGNMENT & DATA INGESTION
+    # =========================================================================
+    
 
-    stacked = np.stack(bands_data, axis=0).transpose(1, 2, 0)
-    print(f"✅ Stacked shape: {stacked.shape} (H, W, 10)")
+    with rasterio.open(PRISMA_TIF) as src:
+        profile = src.profile.copy()
+        
+        band_indices = []
+        logging.info("Mapping model features to PRISMA spectral bands...")
+        
+        for feat in MODEL_BANDS:
+            # Extract target wavelength from feature name (e.g., 'X_400' -> 400.0)
+            target_wl = float(feat.split('_')[1])
+            
+            # Identify the closest existing PRISMA band index
+            idx = (np.abs(PRISMA_VNIR_WL - target_wl)).argmin()
+            band_num = int(idx + 1) # Rasterio uses 1-based indexing
+            
+            band_indices.append(band_num)
+            logging.info(f"{feat:>8} -> PRISMA Band #{band_num:2d} ({PRISMA_VNIR_WL[idx]:.2f} nm)")
 
-# ============================================================
-# 6) Predict per-pixel
-# ============================================================
-pixels_flat = stacked.reshape(-1, len(model_bands))
-valid_mask = np.all(np.isfinite(pixels_flat), axis=1)
+        # Load and scale imagery
+        bands_data = []
+        for bnum in band_indices:
+            arr = src.read(bnum).astype(np.float32)
+            
+            # PRISMA L2D data scaling: Convert 0-10000 range to 0.0-1.0 reflectance
+            if np.nanmax(arr) > 10:
+                arr *= 0.0001
+            
+            bands_data.append(arr)
 
-print(f"Valid pixels: {valid_mask.sum()} / {pixels_flat.shape[0]}")
+        stacked = np.stack(bands_data, axis=-1)
 
-preds = np.full((pixels_flat.shape[0],), np.nan, dtype=np.float32)
-preds[valid_mask] = model.predict(pixels_flat[valid_mask])
+    # =========================================================================
+    # 3) SPATIAL PREDICTION (INFERENCE)
+    # =========================================================================
+    h, w, c = stacked.shape
+    pixels_flat = stacked.reshape(-1, c)
 
-tss_raster = preds.reshape(height, width)
-print(f"✅ Prediction raster ready: {tss_raster.shape}")
+    # Filter for valid water pixels (finite values and positive reflectance)
+    valid_mask = np.all(np.isfinite(pixels_flat), axis=1) & (np.any(pixels_flat > 0, axis=1))
 
-# ============================================================
-# 7) Save output raster
-# ============================================================
-output_dir = os.path.join(model_dir, "Model_sonuclari")
-os.makedirs(output_dir, exist_ok=True)
+    logging.info(f"Processing {np.sum(valid_mask)} valid pixels via LightGBM...")
 
-output_tif = os.path.join(
-    output_dir,
-    "PRISMA_20250310_LightGBM_TSS_Prediction_10bands.tif"
-)
+    # Initialize prediction array with NaNs for background
+    predictions_flat = np.full((pixels_flat.shape[0],), np.nan, dtype=np.float32)
 
-profile.update(dtype=rasterio.float32, count=1, compress="lzw")
+    if np.any(valid_mask):
+        # LightGBM requires DataFrame with specific feature names to maintain consistency
+        X_valid = pd.DataFrame(pixels_flat[valid_mask], columns=MODEL_BANDS)
+        
+        # Execute batch prediction
+        preds = model.predict(X_valid)
+        predictions_flat[valid_mask] = preds.astype(np.float32)
 
-with rasterio.open(output_tif, "w", **profile) as dst:
-    dst.write(tss_raster, 1)
+    # Reshape back to 2D raster dimensions
+    tss_map = predictions_flat.reshape(h, w)
 
-print(f"🎉 TSS prediction saved to:\n{output_tif}")
+    # =========================================================================
+    # 4) GEOTIFF EXPORT
+    # =========================================================================
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_filename = os.path.join(OUTPUT_DIR, "PRISMA_LightGBM_TSS_Prediction.tif")
+
+    # Update metadata for single-band prediction output
+    profile.update(
+        dtype=rasterio.float32, 
+        count=1, 
+        compress="lzw", 
+        nodata=np.nan
+    )
+
+    with rasterio.open(output_filename, "w", **profile) as dst:
+        dst.write(tss_map, 1)
+
+    logging.info(f"Process finalized. Predicted TSS map saved to:\n{output_filename}")
+
+if __name__ == "__main__":
+    main()
