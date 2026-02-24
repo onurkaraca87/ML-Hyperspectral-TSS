@@ -1,130 +1,150 @@
 # -*- coding: utf-8 -*-
 """
-Apply a trained XGBoost model (10 spectral bands) to a PRISMA raster (GeoTIFF)
-and save the prediction raster to the model results folder.
+-------------------------------------------------------------------------------
+Author:      Onur Karaca
+Contact:     onurkaraca87@hotmail.com
+Website:     www.onurkaraca87.com
 
-Author: sokaraca
-Created: 2025-11-03
+-------------------------------------------------------------------------------
+Project:     PRISMA Raster Prediction - XGBoost Pipeline
+Description: 
+    This script implements an automated spatial inference pipeline for PRISMA 
+    L2D hyperspectral imagery using a pre-trained XGBoost regressor.
+    
+    Key Features:
+    - Spectral Alignment: Maps model feature names (wavelengths) to the closest 
+      available bands in the PRISMA VNIR sensor.
+    - Data Scaling: Converts PRISMA Digital Numbers (0-10000) to the reflectance 
+      scale (0-1) required for machine learning models.
+    - Masked Processing: Optimized to process only valid water pixels, 
+      reducing computational overhead.
+    - Export Stability: Generates a georeferenced GeoTIFF with LZW compression.
+-------------------------------------------------------------------------------
 """
 
 import os
-import numpy as np
-import rasterio
+import sys
+import logging
 import joblib
+import numpy as np
+import pandas as pd
+import rasterio
 
-# ========================================
-# 1) Set model path and load the XGBoost model
-# ========================================
-# 🔴 UPDATE THIS to your XGBoost output folder:
-model_dir = r".......\XGBoost"
+# --- Logging Configuration ---
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
-# 🔴 UPDATE THIS to your XGBoost model filename:
-# The training script saved models like: xgb_{N_SELECTED}bands_model_{tag}.pkl
-model_path = os.path.join(model_dir, "XGBoost_Model.pkl")
+# =============================================================================
+# 1) CONFIGURATION & MODEL LOADING
+# =============================================================================
+# Update these paths to match your project directory
+MODEL_PATH = r"path/to/your/xgboost_balanced_model_20260222.pkl"
+PRISMA_TIF = r"path/to/your/Prisma_geo_wm_correct_tif_renamed.tif"
+OUTPUT_DIR = r"path/to/your/output/Prisma_Results"
 
-model = joblib.load(model_path)
-print(f"✅ XGBoost model loaded: {model_path}")
-
-# ========================================
-# 2) PRISMA raster file (GeoTIFF)
-# ========================================
-# 🔴 UPDATE THIS to your PRISMA raster path:
-prisma_tif = r".......\Prisma_20250310.tif"
-
-# ========================================
-# 3) Bands used by the model (10 bands)
-#    -> Fill this based on the 'Selected bands: [...]' line from XGBoost training
-# ========================================
-# Example note (from importance figure / top 10):
-# X_403, X_457, X_416, X_589, X_476, X_400, X_467, X_460, X_618, X_451
-model_bands = [
-    "X_440",
-    "X_791",
-    "X_472",
-    "X_457",
-    "X_495",
-    "X_463",
-    "X_400",
-    "X_449",
-    "X_467",
-    "X_406",
+# Selected Top 10 Bands (Must match the exact feature names used in training)
+MODEL_BANDS = [
+    'X_625', 'X_495', 'X_503', 'X_489', 'X_598', 
+    'X_486', 'X_499', 'X_508', 'X_422', 'X_419'
 ]
 
-# 🔴 UPDATE THIS according to your PRISMA band mapping:
-# Example indices: 'X_400' → band 1, etc.
-# IMPORTANT: Rasterio reads bands using 1-based indexing (band 1..N).
-band_indices = {
-    "X_440": 5,   # example
-    "X_791": 46,  # example
-    "X_472": 10,  # example
-    "X_457": 7,   # example
-    "X_495": 13,  # example
-    "X_463": 8,   # example (replace with the real band number)
-    "X_400": 1,   # example
-    "X_449": 7,   # example
-    "X_467": 9,   # example
-    "X_406": 1,   # example
-}
+# Standard PRISMA VNIR spectral range (63 bands: 400nm to 1010nm)
+PRISMA_VNIR_WL = np.linspace(400, 1010, 63)
 
-# ========================================
-# 4) Read the raster and stack selected bands
-# ========================================
-with rasterio.open(prisma_tif) as src:
-    profile = src.profile.copy()
-    height = src.height
-    width = src.width
 
-    print(f"🚀 Raster dimensions: {width} x {height}")
-    print(f"📏 Total raster bands: {src.count}")
 
-    bands_data = []
-    for band_name in model_bands:
-        if band_name not in band_indices:
-            raise ValueError(f"⚠️ No entry for {band_name} in band_indices!")
-        band_num = band_indices[band_name]
-        if band_num is None:
-            raise ValueError(f"⚠️ Band index for {band_name} is not set in band_indices!")
-        band_array = src.read(band_num).astype(np.float32)
-        bands_data.append(band_array)
+def main():
+    # Verify model existence
+    if not os.path.exists(MODEL_PATH):
+        logging.error(f"XGBoost model file not found at: {MODEL_PATH}")
+        sys.exit()
 
-    # shape: (H, W, C) -> (height, width, 10 bands)
-    stacked = np.stack(bands_data, axis=0).transpose(1, 2, 0)
-    print(f"✅ Stacked bands shape (H, W, C): {stacked.shape}")
+    # Load pre-trained model
+    try:
+        model = joblib.load(MODEL_PATH)
+        logging.info("XGBoost model successfully loaded.")
+    except Exception as e:
+        logging.error(f"Error loading model: {e}")
+        sys.exit()
 
-# ========================================
-# 5) Flatten and mask for prediction
-# ========================================
-pixels_flat = stacked.reshape(-1, len(model_bands))  # (N_pixels, 10)
-valid_mask = np.all(np.isfinite(pixels_flat), axis=1)
-valid_pixels = pixels_flat[valid_mask]
+    # =========================================================================
+    # 2) BAND MAPPING & DATA INGESTION
+    # =========================================================================
+    
 
-print(f"Valid pixels: {valid_pixels.shape[0]} / {pixels_flat.shape[0]}")
+    with rasterio.open(PRISMA_TIF) as src:
+        profile = src.profile.copy()
+        
+        band_indices = []
+        logging.info("=== Executing Spectral Band Alignment ===")
+        
+        for feat in MODEL_BANDS:
+            # Extract target wavelength from string (e.g., 'X_625' -> 625.0)
+            target_wl = float(feat.split('_')[1])
+            
+            # Identify the closest PRISMA band index
+            idx = (np.abs(PRISMA_VNIR_WL - target_wl)).argmin()
+            band_num = int(idx + 1) # Rasterio uses 1-based indexing
+            
+            band_indices.append(band_num)
+            logging.info(f"{feat:>8} -> PRISMA Band #{band_num:2d} ({PRISMA_VNIR_WL[idx]:.2f} nm)")
 
-# XGBoost prediction (model.predict is scikit-learn compatible)
-preds = np.full((pixels_flat.shape[0],), np.nan, dtype=np.float32)
-preds[valid_mask] = model.predict(valid_pixels)
+        # Read and scale spectral data
+        bands_data = []
+        for bnum in band_indices:
+            arr = src.read(bnum).astype(np.float32)
+            
+            # Reflectance Calibration: PRISMA L2D data is typically scaled by 10,000
+            if np.nanmax(arr) > 10:
+                arr *= 0.0001
+            bands_data.append(arr)
 
-ssc_raster = preds.reshape(height, width)
-print(f"✅ Prediction raster shape: {ssc_raster.shape}")
+        stacked_cube = np.stack(bands_data, axis=-1)
 
-# ========================================
-# 6) Save the prediction raster
-# ========================================
-output_dir = os.path.join(model_dir, "Model_results")
-os.makedirs(output_dir, exist_ok=True)
+    # =========================================================================
+    # 3) PIXEL-BASED INFERENCE (PREDICTION)
+    # =========================================================================
+    h, w, c = stacked_cube.shape
+    pixels_flat = stacked_cube.reshape(-1, c)
 
-output_tif = os.path.join(
-    output_dir,
-    "PRISMA_20250310_XGB_SSC_Prediction_10bands_max232.tif",
-)
+    # Filter for valid pixels (non-NaN and positive reflectance values)
+    valid_mask = np.all(np.isfinite(pixels_flat), axis=1) & (np.any(pixels_flat > 0, axis=1))
 
-profile.update(
-    dtype=rasterio.float32,
-    count=1,
-    compress="lzw",
-)
+    # Initialize results array with NaNs
+    predictions_flat = np.full((pixels_flat.shape[0],), np.nan, dtype=np.float32)
 
-with rasterio.open(output_tif, "w", **profile) as dst:
-    dst.write(ssc_raster, 1)
+    if np.any(valid_mask):
+        logging.info(f"Processing {np.sum(valid_mask)} valid water pixels...")
+        
+        # XGBoost requires feature names to match training data exactly
+        X_valid = pd.DataFrame(pixels_flat[valid_mask], columns=MODEL_BANDS)
+        
+        # Execute prediction
+        preds_valid = model.predict(X_valid).astype(np.float32)
+        predictions_flat[valid_mask] = preds_valid
+    else:
+        logging.warning("No valid water pixels detected in the input raster!")
 
-print(f"🎉 SSC prediction saved to:\n{output_tif}")
+    # Reshape prediction array back to 2D spatial dimensions
+    tss_map = predictions_flat.reshape(h, w)
+
+    # =========================================================================
+    # 4) GEOTIFF EXPORT
+    # =========================================================================
+    os.makedirs(output_dir, exist_ok=True)
+    output_filename = os.path.join(output_dir, "PRISMA_XGBoost_TSS_Prediction.tif")
+
+    # Update metadata for single-band output
+    profile.update(
+        dtype=rasterio.float32, 
+        count=1, 
+        compress="lzw", 
+        nodata=np.nan
+    )
+
+    with rasterio.open(output_filename, "w", **profile) as dst:
+        dst.write(tss_map, 1)
+
+    logging.info(f"Success! Prediction map generated at:\n{output_filename}")
+
+if __name__ == "__main__":
+    main()
