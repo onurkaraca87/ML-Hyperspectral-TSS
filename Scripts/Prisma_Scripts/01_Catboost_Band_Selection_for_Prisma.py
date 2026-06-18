@@ -1,149 +1,195 @@
 # -*- coding: utf-8 -*-
 """
--------------------------------------------------------------------------------
-Author:      Onur Karaca
-Contact:     onurkaraca87@hotmail.com
-Website:     www.onurkaraca87.com
--------------------------------------------------------------------------------
-Project:     PRISMA Raster Prediction - TSS Mapping
-Description: 
-    This script performs pixel-based Total Suspended Solids (TSS) prediction 
-    using a pre-trained CatBoost model and PRISMA hyperspectral L2D imagery.
-    It handles band matching, scaling, and spatial export to GeoTIFF.
--------------------------------------------------------------------------------
+CatBoost Stable Pipeline - Final Visuals & Model Export
+- Added: .pkl model saving (joblib).
+- Added: Feature Importance Top-10 list, plot, and TXT export.
+- Visuals: Bottom-right label with BOTH Train & Test R2/RMSE.
 """
 
-import os
-import logging
-import joblib
+import os, re, warnings
+from datetime import datetime
+from pathlib import Path
+
+# Thread yönetimi
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import numpy as np
-import rasterio
+import pandas as pd
+import matplotlib.pyplot as plt
+import joblib
+import shap
+import seaborn as sns
 
-# =============================================================================
-# LOGGING CONFIGURATION
-# =============================================================================
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, KFold
+from scipy.stats import randint
+from catboost import CatBoostRegressor
 
-# =============================================================================
-# CONFIGURATION & GENERIC PATHS
-# =============================================================================
-# Update these placeholders with your specific file paths
-MODEL_PATH = r"path/to/your/models/catboost_model.pkl"
-INPUT_TIF = r"path/to/your/data/prisma_input_image.tif"
-OUTPUT_DIR = r"path/to/your/results"
-OUTPUT_FILENAME = "PRISMA_TSS_Map_Output.tif"
+# ==============================
+# 0) SETTINGS
+# ==============================
+file_path = r"...................\Hyperspectral_Water_Reflectance_Spectra_and_TSS_in_Matagorda_and_Trinity_Bays.xlsx"
+output_root = r".................\Prisma_Result\Catboost_Output"
+METHOD_TAG = "CatBoost_Model"
+output_dir = os.path.join(output_root, METHOD_TAG)
+os.makedirs(output_dir, exist_ok=True)
 
-# Model expects specific bands in this exact order (Wavelengths in nm)
-MODEL_FEATURE_NAMES = [
-    'X_634', 'X_647', 'X_422', 'X_584', 'X_482', 
-    'X_897', 'X_719', 'X_600', 'X_889', 'X_779'
-]
+tag = datetime.now().strftime("%Y%m%d")
+WL_COL, WL_MIN, WL_MAX = "Wavelength (nm)", 400, 1000
+TEST_SIZE, RANDOM_STATE = 0.20, 42
+CV_SPLITS, N_TOP_BANDS = 3, 10
+S_TEST, S_TRAIN = 28, 30
 
-# PRISMA VNIR Wavelength Definition (Standard 63 bands from 400nm to 1010nm)
-PRISMA_VNIR_WL = np.linspace(400, 1010, 63)
+# ==============================
+# 1) DATA PREPARATION
+# ==============================
+raw_df = pd.read_excel(file_path)
+tmp = raw_df.copy()
+tmp[WL_COL] = pd.to_numeric(tmp[WL_COL], errors="coerce")
+tmp = tmp.dropna(subset=[WL_COL])
+df_idx = tmp.groupby(WL_COL).mean(numeric_only=True).sort_index()
 
-# Scaling Factor: Convert PRISMA L2D (0-10000) to Surface Reflectance (0-1)
-SCALE_FACTOR = 0.0001
+band_names = [f"X_{int(wl)}" for wl in df_idx.index]
+def parse_tss(col):
+    m = re.search(r"(?:-|_|\s)(\d+(?:\.\d+)?)\s*$", str(col))
+    return float(m.group(1)) if m else None
 
-def map_prisma_bands(target_features, sensor_wavelengths):
-    """
-    Maps requested model feature names to the nearest PRISMA band indices.
-    
-    Args:
-        target_features (list): Names of bands required by the model (e.g., 'X_634').
-        sensor_wavelengths (ndarray): Center wavelengths of the PRISMA sensor.
-        
-    Returns:
-        list: 1-based band indices for Rasterio.
-    """
-    indices = []
-    logging.info("Initializing Band Mapping...")
-    for feature in target_features:
-        target_wl = float(feature.split('_')[1])
-        # Find index of nearest wavelength in sensor array
-        idx = (np.abs(sensor_wavelengths - target_wl)).argmin()
-        band_no = int(idx + 1) # Rasterio uses 1-based indexing
-        indices.append(band_no)
-        logging.info(f"  Mapping {feature:>5} -> PRISMA Band #{band_no:2d} ({sensor_wavelengths[idx]:.2f} nm)")
-    return indices
+sample_cols, tss_vals = [], []
+for col in raw_df.columns:
+    if col == WL_COL: continue
+    tss = parse_tss(col)
+    if tss is not None and col in df_idx.columns:
+        sample_cols.append(col); tss_vals.append(tss)
 
-def run_prediction():
-    """
-    Executes the full prediction workflow:
-    1. Load model 2. Extract bands 3. Scale data 4. Predict 5. Export GeoTIFF
-    """
-    
-    # 1. Load Pre-trained Machine Learning Model
-    if not os.path.exists(MODEL_PATH):
-        logging.error(f"Model file not found. Please check path: {MODEL_PATH}")
-        return
+df = pd.DataFrame([[tss] + df_idx[c].tolist() for c, tss in zip(sample_cols, tss_vals)], 
+                  columns=["TSS"] + band_names).dropna().reset_index(drop=True)
 
-    logging.info("Loading CatBoost model...")
-    try:
-        model = joblib.load(MODEL_PATH)
-    except Exception as e:
-        logging.error(f"Failed to load model: {e}")
-        return
+X_cols = [c for c in df.columns if c.startswith("X_") and WL_MIN <= int(c.split("_")[1]) <= WL_MAX]
+X_full, y = df[X_cols], df["TSS"].astype(float)
 
-    # 2. Read and Prepare Raster Data
-    logging.info(f"Opening PRISMA hyperspectral image...")
-    try:
-        with rasterio.open(INPUT_TIF) as src:
-            raster_profile = src.profile.copy()
-            target_indices = map_prisma_bands(MODEL_FEATURE_NAMES, PRISMA_VNIR_WL)
-            
-            bands_list = []
-            for b_idx in target_indices:
-                # Apply constant scaling to match model training distribution (0-1)
-                band_array = src.read(b_idx).astype(np.float32) * SCALE_FACTOR
-                bands_list.append(band_array)
-            
-            data_stack = np.stack(bands_list, axis=-1)
-            height, width, channels = data_stack.shape
-    except Exception as e:
-        logging.error(f"Error reading raster file: {e}")
-        return
+# ==============================
+# 2) FEATURE SELECTION & TXT EXPORT
+# ==============================
+cat_fs = CatBoostRegressor(iterations=200, random_seed=RANDOM_STATE, verbose=False, allow_writing_files=False)
+cat_fs.fit(X_full, y)
+feat_imp = pd.Series(cat_fs.get_feature_importance(), index=X_full.columns).sort_values(ascending=False)
 
-    # 3. Data Flattening and Water Masking
-    pixels = data_stack.reshape(-1, channels)
-    
-    # Identify valid water pixels: Non-finite values and non-zero reflectance
-    valid_mask = np.all(np.isfinite(pixels), axis=1) & (np.any(pixels > 0, axis=1))
-    
-    num_valid = np.sum(valid_mask)
-    logging.info(f"Processing {num_valid} valid water pixels for TSS prediction...")
+selected_bands = list(feat_imp.index[:N_TOP_BANDS])
 
-    # 4. Model Inference
-    # Initialize output array with NaNs (NoData)
-    predictions = np.full((pixels.shape[0],), np.nan, dtype=np.float32)
+# ✅ YENİ: Seçilen band isimlerini .txt dosyasına kaydet
+txt_path = os.path.join(output_dir, f"selected_bands_{tag}.txt")
+with open(txt_path, "w") as f:
+    f.write(f"Top {N_TOP_BANDS} Selected Bands for CatBoost\n")
+    f.write("="*30 + "\n")
+    for i, band in enumerate(selected_bands, 1):
+        score = feat_imp[band]
+        f.write(f"{i}. {band} (Score: {score:.4f})\n")
 
-    if num_valid > 0:
-        predictions[valid_mask] = model.predict(pixels[valid_mask]).astype(np.float32)
-    else:
-        logging.warning("No valid pixels identified for the current scene.")
+print(f"✅ Band isimleri kaydedildi: {txt_path}")
 
-    # Reshape prediction flat array back to 2D spatial dimensions
-    tss_map = predictions.reshape(height, width)
+# Feature Importance Grafiği
+plt.figure(figsize=(8, 5))
+sns.barplot(x=feat_imp.values[:N_TOP_BANDS], y=feat_imp.index[:N_TOP_BANDS], palette="viridis")
+plt.title(f"Top {N_TOP_BANDS} Feature Importance")
+plt.xlabel("Importance Score")
+plt.tight_layout()
+plt.savefig(Path(output_dir, f"feature_importance_top10_{tag}.png"), dpi=300)
+plt.close()
 
-    # 5. Export Result to GeoTIFF
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR)
-        
-    output_path = os.path.join(OUTPUT_DIR, OUTPUT_FILENAME)
-    
-    # Update profile for single-band float output
-    raster_profile.update(
-        dtype=rasterio.float32, 
-        count=1, 
-        compress="lzw", 
-        nodata=np.nan
-    )
+X_top = df[selected_bands]
 
-    logging.info(f"Exporting result to {output_path}...")
-    with rasterio.open(output_path, "w", **raster_profile) as dst:
-        dst.write(tss_map, 1)
+# ==============================
+# 3) SPLIT
+# ==============================
+max_idx = y[y == y.max()].index.tolist()
+other_idx = y.index.difference(max_idx)
+X_train, X_test, y_train, y_test = train_test_split(X_top.loc[other_idx], y.loc[other_idx], test_size=TEST_SIZE, random_state=RANDOM_STATE)
+if len(max_idx) > 0:
+    X_train = pd.concat([X_train, X_top.loc[max_idx]])
+    y_train = pd.concat([y_train, y.loc[max_idx]])
+    X_test = pd.concat([X_test, X_top.loc[max_idx]])
+    y_test = pd.concat([y_test, y.loc[max_idx]])
 
-    logging.info("Process completed successfully!")
+# ==============================
+# 4) STABLE PARAMETER TUNING
+# ==============================
+dist = {
+    "iterations": randint(800, 1400),
+    "depth": [2, 3],                         
+    "learning_rate": [0.01, 0.015, 0.02, 0.03], 
+    "l2_leaf_reg": [30, 50, 70, 90],         
+    "subsample": [0.6, 0.7, 0.8],
+    "random_strength": [1, 2, 5, 10]
+}
 
-if __name__ == "__main__":
-    run_prediction()
+search = RandomizedSearchCV(
+    CatBoostRegressor(loss_function='RMSE', random_seed=RANDOM_STATE, bootstrap_type='Bernoulli', 
+                      verbose=False, allow_writing_files=False),
+    param_distributions=dist, n_iter=35, cv=KFold(CV_SPLITS, shuffle=True, random_state=RANDOM_STATE),
+    scoring="neg_root_mean_squared_error", random_state=RANDOM_STATE, refit=True
+)
+search.fit(X_train, y_train)
+best_cat = search.best_estimator_
+
+# ✅ Model Kaydetme (.pkl)
+model_path = Path(output_dir, f"catboost_model_{tag}.pkl")
+joblib.dump(best_cat, model_path)
+print(f"✅ Model kaydedildi: {model_path}")
+
+# ==============================
+# 5) SCATTER PLOT & METRICS
+# ==============================
+y_pred_test, y_pred_train = best_cat.predict(X_test), best_cat.predict(X_train)
+r2_t, rmse_t = r2_score(y_test, y_pred_test), np.sqrt(mean_squared_error(y_test, y_pred_test))
+r2_tr, rmse_tr = r2_score(y_train, y_pred_train), np.sqrt(mean_squared_error(y_train, y_pred_train))
+
+fig, ax = plt.subplots(figsize=(6.5, 6.5))
+ax.scatter(y_test, y_pred_test, c="red", s=S_TEST, label=f"Test (n={len(y_test)})", zorder=2, alpha=0.8)
+ax.scatter(y_train, y_pred_train, c="black", s=S_TRAIN, label=f"Train (n={len(y_train)})", zorder=3, alpha=0.9)
+
+lims = [min(y.min(), y_pred_test.min()), max(y.max(), y_pred_test.max())]
+ax.plot(lims, lims, "--", color="gray", zorder=1)
+
+ax.set_xlabel("Actual TSS")
+ax.set_ylabel("Predicted TSS")
+ax.set_title(f"CatBoost Model: Train vs Test Balance")
+ax.legend(loc="upper left")
+ax.grid(True, alpha=0.2)
+
+dual_label = (
+    f"Train Metrics:\n"
+    f"R² = {r2_tr:.3f}\n"
+    f"RMSE = {rmse_tr:.3f}\n\n"
+    f"Test Metrics:\n"
+    f"R² = {r2_t:.3f}\n"
+    f"RMSE = {rmse_t:.3f}"
+)
+
+ax.text(0.98, 0.02, dual_label, transform=ax.transAxes, ha="right", va="bottom",
+        fontsize=9, fontweight='medium',
+        bbox=dict(boxstyle="round,pad=0.5", fc="white", ec="black", alpha=0.8))
+
+plt.tight_layout()
+plt.savefig(Path(output_dir, f"stable_scatter_labeled_{tag}.png"), dpi=1200)
+
+# ==============================
+# 6) SHAP & PIE
+# ==============================
+explainer = shap.TreeExplainer(best_cat)
+shap_values = explainer.shap_values(X_train)
+blue, green, red = (400, 500), (501, 600), (601, 800)
+mean_abs_shap = np.abs(shap_values).mean(axis=0)
+groups = {"Blue": 0.0, "Green": 0.0, "Red": 0.0}
+for bname, val in zip(X_train.columns, mean_abs_shap):
+    w = int(bname.split("_")[1])
+    if blue[0] <= w <= blue[1]: groups["Blue"] += val
+    elif green[0] <= w <= green[1]: groups["Green"] += val
+    elif red[0] <= w <= red[1]: groups["Red"] += val
+
+plt.figure(figsize=(6,6))
+plt.pie(groups.values(), labels=[f"{k} ({v/sum(groups.values())*100:.1f}%)" for k,v in groups.items()], autopct='%1.1f%%', startangle=140)
+plt.title("Importance by Color Group")
+plt.savefig(Path(output_dir, f"color_pie_{tag}.png"), dpi=300)
+
+print(f"✅ Başarılı! \nTrain R2: {r2_tr:.3f} | Test R2: {r2_t:.3f}")
