@@ -5,7 +5,7 @@ This repository provides an end-to-end workflow to estimate Total Suspended Soli
 ![Graphic Abstract](https://readme-typing-svg.demolab.com?font=Fira+Code&size=32&pause=900&color=00C2FF&center=true&vCenter=true&width=1000&lines=GRAPHIC+ABSTRACT;Train+%E2%86%92+Apply+%E2%86%92+GeoTIFF+TSS+Maps)
 
 
-![Screenshot_2](Figures/Screenshot_2.jpg)
+![Screenshot_2](Figures/Screenshot_2.png)
 
 Main idea (2-step):
 1) Train (tabular) -> produces a pretrained model file (.pkl)
